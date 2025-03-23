@@ -6,7 +6,8 @@ import hashlib
 import time
 import json
 import pytesseract
-from datetime import datetime
+import sys
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import google.generativeai as genai
 from PIL import Image
@@ -19,6 +20,15 @@ from langchain.schema import Document
 import docx
 from docx.shared import Inches
 import argparse
+import glob
+
+# Configure stdout to use UTF-8 if possible (helps with Windows encoding issues)
+if sys.stdout.encoding != 'utf-8':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except AttributeError:
+        # For older Python versions
+        pass
 
 # Configure Tesseract OCR path
 pytesseract.pytesseract.tesseract_cmd = r'D:\tesseract\tesseract.exe'
@@ -28,10 +38,10 @@ load_dotenv()
 
 # Constants for the application
 DEFAULT_QUERY = "Complete Journey of Committing and Deploying of a Symbox Component"
-VIDEO_FILES = [
-    os.path.join("videos", "Product_session_17_Version_Repo_by_Eduard_02Dec2022_000.mp4"),
-    os.path.join("videos", "Product_session_17_Version_Repo_by_Eduard_02Dec2022_001.mp4")
+ADDITIONAL_PROMPTS = [
+    "How do you integrate an external system with Symbox?"
 ]
+VIDEOS_FOLDER = "videos"
 FRAME_EXTRACTION_INTERVAL = 10  # Extract a frame every 10 seconds
 OCR_CACHE_DIR = "ocr_cache"
 TEMP_DIR = "temp_frames"
@@ -69,6 +79,31 @@ token_usage = {
     "total_output_tokens": 0,
     "requests": 0
 }
+
+# Track performance metrics
+performance_metrics = {
+    "video_processing_times": {},
+    "total_runtime": 0,
+    "video_lengths": {}
+}
+
+def get_video_duration(video_path):
+    """
+    Get the duration of a video in seconds
+    
+    Args:
+        video_path: Path to the video file
+    
+    Returns:
+        Duration in seconds
+    """
+    video = cv2.VideoCapture(video_path)
+    fps = video.get(cv2.CAP_PROP_FPS)
+    frame_count = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
+    video.release()
+    
+    duration = frame_count / fps if fps > 0 else 0
+    return duration
 
 def get_video_hash(video_path):
     """
@@ -130,14 +165,14 @@ def cache_ocr_results(image, video_name, frame_idx):
     
     # Check if result is already cached
     if os.path.exists(cache_path):
-        with open(cache_path, 'r') as f:
+        with open(cache_path, 'r', encoding='utf-8') as f:
             return f.read()
     
     # Perform OCR
     ocr_text = perform_ocr(image)
     
     # Cache the result
-    with open(cache_path, 'w') as f:
+    with open(cache_path, 'w', encoding='utf-8') as f:
         f.write(ocr_text)
     
     return ocr_text
@@ -158,13 +193,16 @@ def extract_frames_from_video(video_path, interval=FRAME_EXTRACTION_INTERVAL, fo
     frame_timestamps = []
     ocr_results = []
     
+    # Track processing time
+    start_time = time.time()
+    
     # Check if we have a cached version
     video_hash = get_video_hash(video_path)
     cache_file = os.path.join(INDEX_CACHE_DIR, f"{video_hash}_frames.json")
     
     if os.path.exists(cache_file) and not force_reprocess:
         print(f"Using cached frames for {video_path}")
-        with open(cache_file, 'r') as f:
+        with open(cache_file, 'r', encoding='utf-8') as f:
             cache_data = json.load(f)
             
         # Load frames from cached paths
@@ -174,8 +212,17 @@ def extract_frames_from_video(video_path, interval=FRAME_EXTRACTION_INTERVAL, fo
                 frames.append(Image.open(frame_path))
                 frame_timestamps.append(frame_info['timestamp'])
                 ocr_results.append(frame_info['ocr_text'])
+        
+        # Get video duration
+        video_duration = get_video_duration(video_path)
+        performance_metrics["video_lengths"][video_path] = video_duration
             
         if frames:
+            # Record processing time
+            end_time = time.time()
+            processing_time = end_time - start_time
+            performance_metrics["video_processing_times"][video_path] = processing_time
+            
             return frames, frame_timestamps, ocr_results
     
     print(f"Extracting frames from {video_path}")
@@ -187,6 +234,9 @@ def extract_frames_from_video(video_path, interval=FRAME_EXTRACTION_INTERVAL, fo
     fps = video.get(cv2.CAP_PROP_FPS)
     frame_count = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
     duration = frame_count / fps
+    
+    # Store video duration
+    performance_metrics["video_lengths"][video_path] = duration
     
     # Calculate frame indices to extract based on interval
     frame_indices = [int(fps * i) for i in range(0, int(duration), interval)]
@@ -231,8 +281,13 @@ def extract_frames_from_video(video_path, interval=FRAME_EXTRACTION_INTERVAL, fo
     video.release()
     
     # Save cache data
-    with open(cache_file, 'w') as f:
-        json.dump(cache_data, f)
+    with open(cache_file, 'w', encoding='utf-8') as f:
+        json.dump(cache_data, f, ensure_ascii=False)
+    
+    # Record processing time
+    end_time = time.time()
+    processing_time = end_time - start_time
+    performance_metrics["video_processing_times"][video_path] = processing_time
     
     print(f"Extracted {len(frames)} frames from {video_path}")
     return frames, frame_timestamps, ocr_results
@@ -382,10 +437,15 @@ def generate_final_response_with_gemini(query, vector_store, video_frames, all_v
     docs = combined_search(query, vector_store)
     
     # Prepare content for Gemini
-    context = "\n\n".join([
-        f"Source: {doc.metadata['source']} at {doc.metadata['timestamp_formatted']}\n{doc.page_content}" 
-        for doc in docs
-    ])
+    context_items = []
+    for doc in docs:
+        source_video = os.path.basename(doc.metadata['source'])
+        timestamp = doc.metadata['timestamp_formatted']
+        context_items.append(
+            f"Source: {source_video} at {timestamp}\n{doc.page_content}"
+        )
+    
+    context = "\n\n".join(context_items)
     
     # Track relevant frames from search results
     relevant_frames = []
@@ -435,6 +495,8 @@ Based on analysis of video tutorials, here's relevant information:
 
 Please provide a detailed explanation that answers the user's question.
 Structure your answer with clear headings and steps where appropriate.
+IMPORTANT: Always include video references and timestamps for each piece of information in your answer.
+For each point or step you explain, add a citation in the format "[Source: Video_Name at MM:SS]" at the end of the relevant paragraph or bullet point.
 """
 
     # Create a Gemini model instance
@@ -530,6 +592,21 @@ def save_response_as_docx(response_text, key_frames, relevant_frames, relevant_f
     # Add a page break after TOC
     doc.add_page_break()
     
+    # Add reference section before content
+    doc.add_heading("Video References", level=1)
+    
+    # Create a set of unique video files used in this response
+    referenced_videos = set()
+    for info in relevant_frame_info:
+        referenced_videos.add(os.path.basename(info['video']))
+    
+    # Add list of video references
+    for video in sorted(referenced_videos):
+        doc.add_paragraph(f"• {video}", style='List Bullet')
+    
+    # Add a page break after references
+    doc.add_page_break()
+    
     # Add content heading
     doc.add_heading("Guide Content", level=1)
     
@@ -567,7 +644,20 @@ def save_response_as_docx(response_text, key_frames, relevant_frames, relevant_f
             for item in bullet_items:
                 # Remove the bullet marker and add as a list item
                 item_text = item[2:].strip()
-                doc.add_paragraph(item_text, style='List Bullet')
+                p = doc.add_paragraph(item_text, style='List Bullet')
+                
+                # Make citation in italics if present
+                if "[Source:" in item_text:
+                    runs = p.runs
+                    if runs:
+                        text = runs[-1].text
+                        source_idx = text.find("[Source:")
+                        if source_idx >= 0:
+                            # Split the run at the citation
+                            runs[-1].text = text[:source_idx]
+                            citation_run = p.add_run(text[source_idx:])
+                            citation_run.italic = True
+                            citation_run.font.color.rgb = docx.shared.RGBColor(128, 128, 128)
             
             i = j - 1  # Update the counter to skip processed items
         
@@ -592,21 +682,47 @@ def save_response_as_docx(response_text, key_frames, relevant_frames, relevant_f
                 pos = item.find('. ')
                 if pos != -1:
                     item_text = item[pos + 2:].strip()
-                    doc.add_paragraph(item_text, style='List Number')
+                    p = doc.add_paragraph(item_text, style='List Number')
+                    
+                    # Make citation in italics if present
+                    if "[Source:" in item_text:
+                        runs = p.runs
+                        if runs:
+                            text = runs[-1].text
+                            source_idx = text.find("[Source:")
+                            if source_idx >= 0:
+                                # Split the run at the citation
+                                runs[-1].text = text[:source_idx]
+                                citation_run = p.add_run(text[source_idx:])
+                                citation_run.italic = True
+                                citation_run.font.color.rgb = docx.shared.RGBColor(128, 128, 128)
             
             i = j - 1  # Update the counter to skip processed items
             
         # Regular paragraph
         else:
             if para:  # Only add non-empty paragraphs
-                doc.add_paragraph(para)
+                p = doc.add_paragraph(para)
+                
+                # Make citation in italics if present
+                if "[Source:" in para:
+                    runs = p.runs
+                    if runs:
+                        text = runs[-1].text
+                        source_idx = text.find("[Source:")
+                        if source_idx >= 0:
+                            # Split the run at the citation
+                            runs[-1].text = text[:source_idx]
+                            citation_run = p.add_run(text[source_idx:])
+                            citation_run.italic = True
+                            citation_run.font.color.rgb = docx.shared.RGBColor(128, 128, 128)
         
         i += 1
     
     # Add a page break before images
     doc.add_page_break()
     
-    # Add a section for relevant frames from the search
+    # Add a section for relevant frames from the search with timestamps
     if relevant_frames:
         doc.add_heading("Relevant Tutorial Screenshots", level=1)
         
@@ -616,9 +732,20 @@ def save_response_as_docx(response_text, key_frames, relevant_frames, relevant_f
             frame.save(temp_img_path)
             
             # Add image to document with caption
-            caption = f"From: {os.path.basename(info['video'])} at {info['timestamp_formatted']}"
-            doc.add_paragraph(caption)
+            video_name = os.path.basename(info['video'])
+            caption = f"Source: {video_name} at {info['timestamp_formatted']}"
+            
+            # Add caption in a distinct format
+            caption_para = doc.add_paragraph()
+            caption_run = caption_para.add_run(caption)
+            caption_run.bold = True
+            caption_run.font.size = docx.shared.Pt(10)
+            
+            # Add the image
             doc.add_picture(temp_img_path, width=Inches(6))
+            
+            # Add a small space between images
+            doc.add_paragraph()
     
     # Add a section for key frames used in the prompt
     doc.add_heading("Additional Tutorial Screenshots", level=1)
@@ -695,9 +822,21 @@ def combined_search(query, vector_store):
 
 def main():
     """Main function to orchestrate the multimodal RAG workflow"""
+    # Track total program runtime
+    program_start_time = time.time()
+    
     parser = argparse.ArgumentParser(description='Multimodal RAG analysis on video files')
     parser.add_argument('--force-reprocess', action='store_true', help='Force reprocessing of videos even if cached')
     args = parser.parse_args()
+    
+    # Find all video files in the videos folder
+    video_files = []
+    for ext in ['*.mp4', '*.avi', '*.mov', '*.mkv']:
+        video_files.extend(glob.glob(os.path.join(VIDEOS_FOLDER, ext)))
+    
+    if not video_files:
+        print(f"No video files found in {VIDEOS_FOLDER} directory!")
+        return
     
     # Print configuration information
     print("=" * 50)
@@ -711,7 +850,7 @@ def main():
     print(f"OCR Engine: Tesseract (Path: {pytesseract.pytesseract.tesseract_cmd})")
     print("=" * 50)
     
-    print(f"Starting multimodal RAG analysis on {len(VIDEO_FILES)} video files...")
+    print(f"Starting multimodal RAG analysis on {len(video_files)} video files...")
     
     all_frames = []
     all_video_names = []
@@ -726,7 +865,7 @@ def main():
             vector_store = FAISS.load_local(VECTOR_DB_PATH, embeddings_model)
             
             # We still need to load frames for visualization
-            for video_file in VIDEO_FILES:
+            for video_file in video_files:
                 print(f"Loading frames from: {video_file}")
                 frames, timestamps, ocr_texts = extract_frames_from_video(video_file, force_reprocess=False)
                 all_frames.extend(frames)
@@ -740,7 +879,7 @@ def main():
     # If we couldn't load the vector store, process videos and create it
     if vector_store is None:
         # Extract frames from all videos
-        for video_file in VIDEO_FILES:
+        for video_file in video_files:
             print(f"Processing video: {video_file}")
             frames, timestamps, ocr_texts = extract_frames_from_video(video_file, force_reprocess=args.force_reprocess)
             all_frames.extend(frames)
@@ -748,7 +887,7 @@ def main():
             all_frame_timestamps.append(timestamps)
             all_ocr_results.append(ocr_texts)
         
-        # Analyze frames in batches (Claude can handle up to 5 images per request)
+        # Analyze frames in batches (Gemini can handle multiple images per request)
         frame_analysis_results = []
         batch_size = 5
         
@@ -771,7 +910,7 @@ def main():
             frame_analysis_results.append(analysis)
             
             # Save to prevent losing progress
-            with open(f"frame_analysis_batch_{i // batch_size}.txt", "w") as f:
+            with open(f"frame_analysis_batch_{i // batch_size}.txt", "w", encoding='utf-8') as f:
                 f.write(analysis)
             
             # Respect API rate limits
@@ -786,12 +925,41 @@ def main():
             all_ocr_results
         )
     
+    # Print video processing statistics
+    print("\nVIDEO PROCESSING STATISTICS:")
+    for video_path, duration in performance_metrics["video_lengths"].items():
+        processing_time = performance_metrics["video_processing_times"].get(video_path, 0)
+        minutes = int(duration // 60)
+        seconds = int(duration % 60)
+        print(f"Video: {os.path.basename(video_path)}")
+        print(f"  Length: {minutes} minutes {seconds} seconds")
+        print(f"  Processing Time: {processing_time:.2f} seconds")
+    
+    # Process the default prompts automatically
+    print("\nProcessing default prompts:")
+    for prompt in [DEFAULT_QUERY] + ADDITIONAL_PROMPTS:
+        print(f"\nGenerating response to: {prompt}")
+        response, key_frames, relevant_frames, relevant_frame_info = generate_final_response_with_gemini(
+            prompt, vector_store, all_frames, all_video_names, all_frame_timestamps
+        )
+        
+        # Save the result as text file
+        output_file = f"response_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        with open(output_file, "w", encoding='utf-8') as f:
+            f.write(response)
+        
+        # Save the result as docx file with images
+        docx_path = save_response_as_docx(response, key_frames, relevant_frames, relevant_frame_info, prompt)
+        
+        print(f"Response saved to {output_file}")
+        print(f"Response with images saved to {docx_path}")
+    
     # Interactive query loop
     print("\nVideo processing complete. Ready for questions!")
     print("Enter 'q' to quit.")
     
     while True:
-        user_query = input("\nEnter your question about Symbox component deployment: ")
+        user_query = input("\nEnter your question about Symbox (type 'q' to quit): ")
         
         if user_query.lower() == 'q':
             print("Exiting...")
@@ -808,7 +976,7 @@ def main():
         
         # Save the result as text file
         output_file = f"response_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-        with open(output_file, "w") as f:
+        with open(output_file, "w", encoding='utf-8') as f:
             f.write(response)
         
         # Save the result as docx file with images
@@ -821,7 +989,14 @@ def main():
         print(response)
         print("-" * 80)
         
+        # Calculate total program runtime
+        program_end_time = time.time()
+        performance_metrics["total_runtime"] = program_end_time - program_start_time
+        total_runtime = timedelta(seconds=int(performance_metrics["total_runtime"]))
+        
         # Print token usage for this session
+        print("\nPERFORMANCE STATISTICS:")
+        print(f"Total Program Runtime: {total_runtime}")
         print("\nTOKEN USAGE STATISTICS:")
         print(f"Total API Requests: {token_usage['requests']}")
         print(f"Total Input Tokens: {token_usage['total_input_tokens']}")
