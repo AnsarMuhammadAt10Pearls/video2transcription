@@ -896,7 +896,7 @@ def main():
             batch_frames = all_frames[i:i+batch_size]
             
             analysis_prompt = """
-            Analyze these video frames from a tutorial about Symbox component development and deployment.
+            Analyze these video frames from a tutorial about Symbox.
             Describe what you see in detail, focusing on:
             1. Any visible user interface elements and what they represent
             2. Any text or code visible in the frame
